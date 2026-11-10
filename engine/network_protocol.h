@@ -1,8 +1,7 @@
-
 #ifndef NETWORK_PROTOCOL_H
 #define NETWORK_PROTOCOL_H
 #define _GNU_SOURCE
-
+/* Enable GNU/POSIX extensions*/
 #include <arpa/inet.h>
 #include <dirent.h>
 #include <errno.h>
@@ -21,16 +20,17 @@
 #include <time.h>
 #include <unistd.h>
 
-#define LINE_MAX_LEN 4096
+#define LINE_MAX_LEN 4096  
 #define TRACKER_MAX 131072
 #define CHUNK_MAX 1024
 #define MAX_SEEDS 32
-
+// Validates a filename to prevent directory traversal and illegal characters
 static inline int good_name(const char *s)
 {
+    // Reject null pointers, empty strings, overly long names, and parent traversal 
     if (!s || !*s || strlen(s) > 150 || strstr(s, ".."))
         return 0;
-
+    // Verify each character against the safe whitelist
     for (; *s; ++s)
     {
         if (!((*s >= 'a' && *s <= 'z') ||
@@ -41,7 +41,7 @@ static inline int good_name(const char *s)
     }
     return 1;
 }
-
+// Reliably transmits an entire buffer over a stream socket
 static inline int send_all(
     int fd, const void *src, size_t len)
 {
@@ -50,10 +50,10 @@ static inline int send_all(
     while (len)
     {
         ssize_t n = send(fd, p, len, MSG_NOSIGNAL);
-
+        // Interrupted by signal handler; retry without penalty 
         if (n < 0 && errno == EINTR)
             continue;
-
+        // n == 0 or negative error denotes broken pipe / peer disconnection 
         if (n <= 0)
             return -1;
 
@@ -62,29 +62,29 @@ static inline int send_all(
     }
     return 0;
 }
-
+// Reads a single newline-delimited line from a socket 
 static inline ssize_t read_line(
     int fd, char *out, size_t cap)
 {
     size_t n = 0;
-
+    // Reserve the final slot for the null terminator
     while (n + 1 < cap)
     {
         char c;
         ssize_t r = recv(fd, &c, 1, 0);
-
+        // Interrupted by system signal; re-attempt read 
         if (r < 0 && errno == EINTR)
             continue;
-
+        // Peer closed socket (0) or fatal read error (-1) 
         if (r <= 0)
         {
             out[n] = '\0';
             return n ? (ssize_t)n : r;
         }
-
+        // End-of-line marker detected; break out to finalize 
         if (c == '\n')
             break;
-
+        // Strip carriage return characters from CRLF line endings 
         if (c != '\r')
             out[n++] = c;
     }
@@ -92,10 +92,11 @@ static inline ssize_t read_line(
     out[n] = '\0';
     return (ssize_t)n;
 }
-
+// Creates an outbound IPv4 TCP socket and connects to a target host/port
 static inline int connect_to(
     const char *ip, int port)
 {
+    // Initialize TCP stream socket over IPv4
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0)
         return -1;
@@ -103,7 +104,7 @@ static inline int connect_to(
     struct sockaddr_in addr = {0};
     addr.sin_family = AF_INET;
     addr.sin_port = htons((uint16_t)port);
-
+    // Convert IP string to network binary format, then initiate handshake 
     if (inet_pton(AF_INET, ip, &addr.sin_addr) != 1 ||
         connect(fd, (struct sockaddr *)&addr,
                 sizeof(addr)) < 0)
@@ -114,13 +115,13 @@ static inline int connect_to(
 
     return fd;
 }
-
+// Initializes a TCP server listening socket bound to all local interfaces
 static inline int listen_on(int port)
 {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0)
         return -1;
-
+    // Allow fast rebinding of local address during restarts
     int yes = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR,
                &yes, sizeof(yes));
@@ -128,8 +129,8 @@ static inline int listen_on(int port)
     struct sockaddr_in addr = {0};
     addr.sin_family = AF_INET;
     addr.sin_port = htons((uint16_t)port);
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
-
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);   // Listen on all network interfaces
+    // Bind address to socket and start backlog queue (max 32 pending connections) 
     if (bind(fd, (struct sockaddr *)&addr,
              sizeof(addr)) ||
         listen(fd, 32))
@@ -140,14 +141,14 @@ static inline int listen_on(int port)
 
     return fd;
 }
-
+// Reads an entire text/config/tracker file from disk into a heap-allocated buffer
 static inline char *load_text(
     const char *path, size_t *bytes)
 {
     FILE *f = fopen(path, "rb");
     if (!f)
         return NULL;
-
+    // Seek to the end to determine file length and check safety boundaries
     if (fseek(f, 0, SEEK_END) ||
         ftell(f) < 0 ||
         ftell(f) > TRACKER_MAX)
@@ -158,14 +159,14 @@ static inline char *load_text(
 
     *bytes = (size_t)ftell(f);
     rewind(f);
-
+    // Allocate memory for file data plus a null terminator
     char *s = malloc(*bytes + 1);
     if (!s)
     {
         fclose(f);
         return NULL;
     }
-
+    // Read file contents into heap buffer
     if (fread(s, 1, *bytes, f) != *bytes)
     {
         free(s);
@@ -173,11 +174,11 @@ static inline char *load_text(
         return NULL;
     }
 
-    s[*bytes] = 0;
+    s[*bytes] = 0;    // Null-terminate string
     fclose(f);
     return s;
 }
-
+// Computes the 128-bit MD5 checksum of an in-memory byte sequence
 static inline int md5_data(
     const void *data, size_t bytes, char hex[33])
 {
@@ -187,24 +188,24 @@ static inline int md5_data(
 
     if (!ctx)
         return -1;
-
+    // Execute the EVP hash lifecycle: Init -> Update -> Final
     int ok =
         EVP_DigestInit_ex(ctx, EVP_md5(), NULL) == 1 &&
         EVP_DigestUpdate(ctx, data, bytes) == 1 &&
         EVP_DigestFinal_ex(ctx, md, &n) == 1;
 
     EVP_MD_CTX_free(ctx);
-
+    // Verify MD5 digest operation produced exactly 16 bytes (128 bits)
     if (!ok || n != 16)
         return -1;
-
+    // Convert 16 binary bytes into a 32-character hexadecimal string 
     for (unsigned i = 0; i < n; ++i)
         sprintf(hex + 2 * i, "%02x", md[i]);
 
     hex[32] = '\0';
     return 0;
 }
-
+// Computes the 128-bit MD5 checksum of an entire file on disk
 static inline int md5_file(
     const char *path, char hex[33])
 {
@@ -227,24 +228,24 @@ static inline int md5_file(
         EVP_DigestInit_ex(ctx, EVP_md5(), NULL) == 1;
 
     size_t n;
-
+    // Stream the file in 8 KiB chunks into the running digest
     while (ok &&
            (n = fread(buf, 1, sizeof(buf), f)) > 0)
         ok = EVP_DigestUpdate(ctx, buf, n) == 1;
-
+    // Check for stream read errors
     if (ferror(f))
         ok = 0;
-
+    // Finalize the hash computation 
     if (ok)
         ok = EVP_DigestFinal_ex(
                  ctx, md, &outn) == 1;
 
     EVP_MD_CTX_free(ctx);
     fclose(f);
-
+    // Confirm 16-byte digest length
     if (!ok || outn != 16)
         return -1;
-
+    // Convert binary digest to a null-terminated 32-character hex string 
     for (unsigned i = 0; i < outn; ++i)
         sprintf(hex + 2 * i, "%02x", md[i]);
 
@@ -252,4 +253,4 @@ static inline int md5_file(
     return 0;
 }
 
-#endif
+#endif // NETWORK_PROTOCOL_H 
