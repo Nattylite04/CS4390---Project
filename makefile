@@ -22,6 +22,10 @@ peer3/peer: peer1/peer
 >mkdir -p peer3
 >cp peer1/peer peer3/peer
 
+demo: all 
+        chmod +x run_local_demo.sh
+        ./run_local_demo.sh
+
 clean:
 >rm -f tracker peer1/peer peer2/peer peer3/peer
 
