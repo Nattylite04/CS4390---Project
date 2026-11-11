@@ -4,12 +4,17 @@
 static char storage[256] = "torrents";
 static int port = 3490;
 
+// how long (seconds) a peer can go without sending updatetracker before we
+// treat it as dead. read from the 3rd value in sconfig, 15 min if it's not there
+static long long peer_timeout = 900;
+
 static pthread_mutex_t file_lock =
     PTHREAD_MUTEX_INITIALIZER;
 
 typedef struct
 {
     int fd;
+    char who[64]; // "ip:port" of the peer that connected, just for printing
 } client_job;
 
 static void answer(int fd, const char *text)
@@ -110,7 +115,14 @@ static void update_record(
         start < 0 || end < start ||
         peer_port < 1 || peer_port > 65535)
     {
-        answer(fd, "<updatetracker invalid fail>\n");
+        // spec wants <updatetracker filename fail>, so try to at least grab
+        // the filename out of the message even if the rest of it is junk
+        char first[160] = "";
+        sscanf(arg, "%159s", first);
+        snprintf(response, sizeof(response),
+                 "<updatetracker %s fail>\n",
+                 good_name(first) ? first : "unknown");
+        answer(fd, response);
         return;
     }
 
@@ -144,6 +156,8 @@ static void update_record(
     }
 
     char *save = NULL;
+    long long now = (long long)time(NULL);
+    int removed = 0;
 
     for (char *line = strtok_r(raw, "\n", &save);
          line;
@@ -152,19 +166,38 @@ static void update_record(
 
         char old_ip[64];
         int old_port;
+        long long old_start, old_end, old_time;
 
-        if (sscanf(line, "%63[^:]:%d:",
-                   old_ip, &old_port) == 2 &&
+        // header lines (Filename:, MD5:, comments) don't match this pattern,
+        // only the ip:port:start:end:timestamp peer lines do
+        int fields = sscanf(line, "%63[^:]:%d:%lld:%lld:%lld",
+                            old_ip, &old_port,
+                            &old_start, &old_end, &old_time);
+
+        // same peer as the one updating -> drop the old line, we write a
+        // fresh one with the new byte range and timestamp below
+        if (fields >= 2 &&
             !strcmp(ip, old_ip) &&
             peer_port == old_port)
             continue;
+
+        // peer hasn't checked in within the timeout, so it's dead. leave it
+        // out so nobody tries to download from it anymore
+        if (fields == 5 && now - old_time > peer_timeout)
+        {
+            printf("[tracker] removing dead peer %s:%d from %s.track "
+                   "(no update for %lld sec)\n",
+                   old_ip, old_port, name, now - old_time);
+            removed++;
+            continue;
+        }
 
         fprintf(f, "%s\n", line);
     }
 
     fprintf(f, "%s:%d:%lld:%lld:%lld\n",
             ip, peer_port,
-            start, end, (long long)time(NULL));
+            start, end, now);
 
     int ok = fclose(f) == 0;
     free(raw);
@@ -177,8 +210,9 @@ static void update_record(
 
     answer(fd, response);
 
-    printf("[tracker] UPDATE %s from %s:%d\n",
-           name, ip, peer_port);
+    printf("[tracker] UPDATE %s from %s:%d (bytes %lld-%lld)%s\n",
+           name, ip, peer_port, start, end,
+           removed ? ", cleaned up dead peers" : "");
 }
 
 static void list_records(int fd)
@@ -267,6 +301,8 @@ static void list_records(int fd)
 
     answer(fd, "<REP LIST END>\n");
     pthread_mutex_unlock(&file_lock);
+
+    printf("[tracker] LIST sent %d tracker file(s)\n", count);
 }
 
 static void get_record(int fd, const char *arg)
@@ -308,6 +344,7 @@ static void get_record(int fd, const char *arg)
 
     if (!data)
     {
+        printf("[tracker] GET %s.track failed, no such tracker file\n", name);
         answer(fd, "<REP GET ERROR>\n");
         return;
     }
@@ -332,6 +369,8 @@ static void *client_thread(void *arg)
 {
     client_job *job = arg;
     int fd = job->fd;
+    char who[64];
+    snprintf(who, sizeof(who), "%s", job->who);
 
     free(job);
 
@@ -339,6 +378,11 @@ static void *client_thread(void *arg)
 
     if (read_line(fd, line, sizeof(line)) > 0)
     {
+        // print which peer sent what, and which thread is handling it,
+        // so during the demo you can see different threads serving peers
+        printf("[tracker] thread %lu got \"%s\" from %s\n",
+               (unsigned long)pthread_self(), line, who);
+
         size_t n = strlen(line);
 
         if (line[0] == '<' &&
@@ -371,6 +415,7 @@ static void *client_thread(void *arg)
         }
         else
         {
+            printf("[tracker] unknown command from %s\n", who);
             answer(fd, "<ERR UNKNOWN COMMAND>\n");
         }
     }
@@ -385,9 +430,11 @@ int main(void)
 
     FILE *cfg = fopen("sconfig", "r");
 
+    // sconfig is: <port> <tracker folder> [peer timeout in seconds]
+    // the timeout is optional, if it's missing we keep the 900 sec default
     if (!cfg ||
-        fscanf(cfg, "%d %255s",
-               &port, storage) != 2)
+        fscanf(cfg, "%d %255s %lld",
+               &port, storage, &peer_timeout) < 2)
     {
         fprintf(stderr,
                 "Missing/invalid sconfig "
@@ -400,6 +447,9 @@ int main(void)
     }
 
     fclose(cfg);
+
+    if (peer_timeout <= 0)
+        peer_timeout = 900;
 
     if (port < 1 || port > 65535 ||
         (mkdir(storage, 0755) &&
@@ -418,12 +468,15 @@ int main(void)
     }
 
     printf("[tracker] listening on port %d; "
-           "directory %s/\n",
-           port, storage);
+           "directory %s/; dead peer timeout %lld sec\n",
+           port, storage, peer_timeout);
 
     while (1)
     {
-        int fd = accept(listener, NULL, NULL);
+        struct sockaddr_in peer_addr;
+        socklen_t addr_len = sizeof(peer_addr);
+        int fd = accept(listener,
+                        (struct sockaddr *)&peer_addr, &addr_len);
 
         if (fd < 0)
         {
@@ -444,12 +497,21 @@ int main(void)
 
         job->fd = fd;
 
+        // save "ip:port" of whoever connected so the thread can print it
+        char ip_text[INET_ADDRSTRLEN] = "?";
+        inet_ntop(AF_INET, &peer_addr.sin_addr, ip_text, sizeof(ip_text));
+        snprintf(job->who, sizeof(job->who), "%s:%d",
+                 ip_text, ntohs(peer_addr.sin_port));
+
         pthread_t thread;
 
+        // every new connection gets its own worker thread, so one slow peer
+        // can't hold up the others
         if (pthread_create(
                 &thread, NULL,
                 client_thread, job) != 0)
         {
+            perror("pthread_create");
             close(fd);
             free(job);
             continue;
