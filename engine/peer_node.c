@@ -1,12 +1,13 @@
-
 #include "network_protocol.h"
 
+// Global peer configuration settings
 static char tracker_ip[64];
 static int tracker_port;
 static int own_port;
 static int refresh_seconds;
 static char shared[256];
 
+// Metadata for a single peer hosting a file range
 typedef struct
 {
     char ip[64];
@@ -14,6 +15,7 @@ typedef struct
     long long first, last, stamp;
 } seed;
 
+// Parsed tracker metadata for a shared file
 typedef struct
 {
     char name[160], hash[33];
@@ -22,6 +24,7 @@ typedef struct
     int count;
 } file_info;
 
+// Thread-safe work queue for parallel chunk downloads
 typedef struct
 {
     file_info *info;
@@ -31,27 +34,28 @@ typedef struct
     pthread_mutex_t queue_lock;
 } chunk_queue;
 
+// Arguments passed to each download worker thread
 typedef struct
 {
     chunk_queue *queue;
     int worker_no;
 } worker_arg;
 
+// Socket descriptor wrapper for incoming peer connections
 typedef struct
 {
     int fd;
 } service_job;
 
-/* Find the local IP used to reach the tracker. */
+// Find the local IP used to reach the tracker.
 static void local_ip(char out[64])
 {
     strcpy(out, "127.0.0.1");
-
     int sock = connect_to(tracker_ip, tracker_port);
-
     if (sock < 0)
         return;
 
+    // Query the local socket address assigned by the OS
     struct sockaddr_in local;
     socklen_t n = sizeof(local);
 
@@ -59,34 +63,31 @@ static void local_ip(char out[64])
             sock, (struct sockaddr *)&local,
             &n) == 0)
     {
-
         inet_ntop(AF_INET, &local.sin_addr,
                   out, 64);
     }
-
     close(sock);
 }
 
-/* Send a command to the tracker and collect its reply. */
+// Send a command to the tracker and collect its reply.
 static int tracker_request(
     const char *request, char **reply)
 {
     int fd = connect_to(tracker_ip, tracker_port);
-
     if (fd < 0)
     {
         perror("connect to tracker");
         return -1;
     }
 
+    // Transmit full request and signal EOF on the write half
     if (send_all(fd, request, strlen(request)))
     {
         close(fd);
         return -1;
     }
-
     shutdown(fd, SHUT_WR);
-
+    
     size_t used = 0, cap = 8192;
     char *data = malloc(cap);
 
@@ -96,6 +97,7 @@ static int tracker_request(
         return -1;
     }
 
+    // Read response dynamically, doubling buffer size as needed
     while (1)
     {
         if (used + 2048 + 1 > cap)
@@ -108,7 +110,6 @@ static int tracker_request(
             }
 
             cap *= 2;
-
             char *larger = realloc(data, cap);
 
             if (!larger)
@@ -117,10 +118,8 @@ static int tracker_request(
                 close(fd);
                 return -1;
             }
-
             data = larger;
         }
-
         ssize_t n = recv(
             fd, data + used, cap - used - 1, 0);
 
@@ -133,10 +132,8 @@ static int tracker_request(
             close(fd);
             return -1;
         }
-
         if (!n)
             break;
-
         used += (size_t)n;
     }
 
@@ -147,7 +144,7 @@ static int tracker_request(
     return 0;
 }
 
-/* Register one complete shared file. */
+// Register one complete shared file.
 static int command_share(const char *name)
 {
     if (!good_name(name))
@@ -159,6 +156,7 @@ static int command_share(const char *name)
     snprintf(path, sizeof(path),
              "%s/%s", shared, name);
 
+    // Verify file exists, is a regular file, and compute its MD5
     struct stat st;
 
     if (stat(path, &st) ||
@@ -173,6 +171,7 @@ static int command_share(const char *name)
 
     local_ip(ip);
 
+    // Format and send the tracker creation message
     snprintf(req, sizeof(req),
              "<createtracker %s %lld class_demo "
              "%s %s %d>\n",
@@ -194,7 +193,7 @@ static int command_share(const char *name)
     return ok ? 0 : 1;
 }
 
-/* Update the byte range available at this peer. */
+// Update the byte range available at this peer.
 static int command_update(
     const char *name, long long first, long long last)
 {
@@ -222,7 +221,7 @@ static int command_update(
     return ok ? 0 : 1;
 }
 
-/* Ask the tracker for the list of available files. */
+// Ask the tracker for the list of available files.
 static int command_list(void)
 {
     char *reply = NULL;
@@ -237,7 +236,7 @@ static int command_list(void)
     return 0;
 }
 
-/* Download, verify and parse a tracker file. */
+// Download, verify and parse a tracker file.
 static int get_tracker(
     const char *filename, file_info *info)
 {
@@ -248,6 +247,7 @@ static int get_tracker(
 
     snprintf(name, sizeof(name), "%s", filename);
 
+    // Strip trailing ".track" extension if provided
     size_t n = strlen(name);
 
     if (n > 6 &&
@@ -266,6 +266,7 @@ static int get_tracker(
     if (tracker_request(req, &response))
         return 1;
 
+    // Locate payload boundaries in the tracker response
     char *begin = strstr(
         response, "<REP GET BEGIN>\n");
 
@@ -285,6 +286,7 @@ static int get_tracker(
 
     size_t bytes = (size_t)(end - begin);
 
+    // Verify integrity of the tracker payload via MD5
     char expected[33], actual[33];
 
     if (sscanf(end,
@@ -310,6 +312,7 @@ static int get_tracker(
         return 1;
     }
 
+    // Parse file metadata headers and peer seed entries line by line
     char *save = NULL;
 
     for (char *line =
@@ -358,6 +361,7 @@ static int get_tracker(
 
     free(contents);
 
+    // Ensure required metadata fields are valid
     if (strcmp(info->name, name) ||
         strlen(info->hash) != 32 ||
         info->size < 0)
@@ -367,7 +371,7 @@ static int get_tracker(
         return 1;
     }
 
-    /* Try seeds with newer timestamps first. */
+    // Try seeds with newer timestamps first.
     for (int i = 0; i < info->count; ++i)
     {
         for (int j = i + 1;
@@ -385,6 +389,7 @@ static int get_tracker(
         }
     }
 
+    // Save a local copy of the verified .track file in cache/
     mkdir("cache", 0755);
 
     char cache_path[256];
@@ -409,7 +414,7 @@ static int get_tracker(
     return 0;
 }
 
-/* Handle one incoming file-chunk request. */
+// Handle one incoming file-chunk request.
 static void *handle_file_client(void *arg)
 {
     service_job *job = arg;
@@ -426,6 +431,7 @@ static void *handle_file_client(void *arg)
         return NULL;
     }
 
+    // Parse and validate the requested filename, byte offset, and length
     char name[160];
     long long offset;
     size_t length;
@@ -464,6 +470,7 @@ static void *handle_file_client(void *arg)
         return NULL;
     }
 
+    // Read requested slice from disk without altering file offset
     unsigned char bytes[CHUNK_MAX];
 
     ssize_t n = pread(
@@ -471,6 +478,7 @@ static void *handle_file_client(void *arg)
 
     close(file);
 
+    // Send data header followed by raw chunk bytes
     if (n != (ssize_t)length)
     {
         send_all(fd, "<GET missing>\n",
@@ -495,7 +503,7 @@ static void *handle_file_client(void *arg)
     return NULL;
 }
 
-/* Periodically update the tracker with shared files. */
+// Periodically update the tracker with shared files.
 static void *heartbeat(void *unused)
 {
     (void)unused;
@@ -509,6 +517,7 @@ static void *heartbeat(void *unused)
         if (!d)
             continue;
 
+        // Scan shared directory and refresh tracker status for each file
         struct dirent *entry;
 
         while ((entry = readdir(d)))
@@ -540,7 +549,7 @@ static void *heartbeat(void *unused)
     return NULL;
 }
 
-/* Run the peer's multithreaded file server. */
+// Run the peer's multithreaded file server.
 static int command_serve(void)
 {
     int listener = listen_on(own_port);
@@ -551,6 +560,7 @@ static int command_serve(void)
         return 1;
     }
 
+    // Start background thread for periodic tracker heartbeats
     pthread_t ticker;
 
     if (!pthread_create(
@@ -564,6 +574,7 @@ static int command_serve(void)
            "threaded socket server ready\n",
            own_port, shared);
 
+    // Accept incoming peer connections and spawn a detached handler thread
     while (1)
     {
         int fd = accept(listener, NULL, NULL);
@@ -607,7 +618,7 @@ static int command_serve(void)
     return 0;
 }
 
-/* Download one chunk from a selected seed. */
+// Download one chunk from a selected seed.
 static int receive_chunk(
     const seed *s,
     const file_info *info,
@@ -620,6 +631,7 @@ static int receive_chunk(
     if (fd < 0)
         return -1;
 
+    // Request chunk and verify response header matches expected size
     char req[256], head[64];
 
     snprintf(req, sizeof(req),
@@ -645,6 +657,7 @@ static int receive_chunk(
         return -1;
     }
 
+    // Receive the exact byte count into memory
     unsigned char buffer[CHUNK_MAX];
     size_t got = 0;
 
@@ -668,6 +681,7 @@ static int receive_chunk(
 
     close(fd);
 
+    // Write downloaded chunk directly to its target offset on disk
     size_t written = 0;
 
     while (written < length)
@@ -691,7 +705,7 @@ static int receive_chunk(
     return 0;
 }
 
-/* Worker threads take the next available chunk. */
+// Worker threads take the next available chunk.
 static void *download_worker(void *arg)
 {
     worker_arg *a = arg;
@@ -701,6 +715,7 @@ static void *download_worker(void *arg)
 
     while (1)
     {
+        // Atomically claim the next chunk index from the shared queue
         pthread_mutex_lock(&q->queue_lock);
 
         size_t chunk = q->next_chunk++;
@@ -718,6 +733,7 @@ static void *download_worker(void *arg)
 
         int success = 0;
 
+        // Iterate through seeds until one serves the needed byte range
         for (int i = 0;
              i < q->info->count; ++i)
         {
@@ -749,6 +765,7 @@ static void *download_worker(void *arg)
             errors++;
     }
 
+    // Record total chunk failures before exiting
     pthread_mutex_lock(&q->queue_lock);
     q->failures += errors;
     pthread_mutex_unlock(&q->queue_lock);
@@ -761,7 +778,7 @@ static void *download_worker(void *arg)
     return NULL;
 }
 
-/* Automatically download a file using 4 workers. */
+// Automatically download a file using 4 workers.
 static int command_get(const char *name)
 {
     file_info info;
@@ -776,6 +793,7 @@ static int command_get(const char *name)
         return 1;
     }
 
+    // Create and pre-allocate the destination file in the shared folder
     char path[512];
 
     snprintf(path, sizeof(path),
@@ -796,6 +814,7 @@ static int command_get(const char *name)
         return 1;
     }
 
+    // Initialize shared chunk queue and spawn 4 worker threads
     chunk_queue q = {
         .info = &info,
         .output = output,
@@ -832,12 +851,14 @@ static int command_get(const char *name)
         started++;
     }
 
+    // Wait for all worker threads to finish
     for (int i = 0; i < started; ++i)
         pthread_join(ids[i], NULL);
 
     pthread_mutex_destroy(&q.queue_lock);
     close(output);
 
+    // Validate completed download against expected MD5 checksum
     char actual[33];
 
     if (q.failures ||
@@ -857,6 +878,7 @@ static int command_get(const char *name)
            "%s; MD5 MATCH %s\n",
            own_port, info.name, actual);
 
+    // Clean up cached tracker file and register as a new seed
     char cache_path[256];
 
     snprintf(cache_path, sizeof(cache_path),
@@ -868,9 +890,10 @@ static int command_get(const char *name)
         info.name, 0, info.size);
 }
 
-/* Read configuration files for this peer. */
+// Read configuration files for this peer.
 static int config(void)
 {
+    // Load tracker connection and heartbeat interval settings
     FILE *f =
         fopen("clientThreadConfig.cfg", "r");
 
@@ -892,6 +915,7 @@ static int config(void)
 
     fclose(f);
 
+    // Load local listening port and shared directory path
     f = fopen("serverThreadConfig.cfg", "r");
 
     if (!f ||
@@ -910,6 +934,7 @@ static int config(void)
 
     fclose(f);
 
+    // Validate parsed port numbers and refresh interval
     if (tracker_port < 1 ||
         tracker_port > 65535 ||
         own_port < 1 ||
@@ -920,13 +945,14 @@ static int config(void)
         return 1;
     }
 
+    // Ensure required working directories exist
     mkdir(shared, 0755);
     mkdir("cache", 0755);
 
     return 0;
 }
 
-/* Peer command-line interface. */
+// Peer command-line interface.
 int main(int argc, char **argv)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -934,6 +960,7 @@ int main(int argc, char **argv)
     if (config())
         return 1;
 
+    // Dispatch subcommands
     if (argc == 2 &&
         !strcmp(argv[1], "serve"))
     {
