@@ -50,6 +50,12 @@ typedef struct
 // Find the local IP used to reach the tracker.
 static void local_ip(char out[64])
 {
+    const char *lan_ip = getenv("PEER_ADVERTISE_IP");
+    if (lan_ip && *lan_ip)
+    {
+        snprintf(out, 64, "%s", lan_ip);
+        return;
+    }
     strcpy(out, "127.0.0.1");
     int sock = connect_to(tracker_ip, tracker_port);
     if (sock < 0)
