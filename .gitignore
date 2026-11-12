@@ -1,0 +1,8 @@
+# Local demo output
+demo_logs/
+
+# Binaries from make
+/tracker
+/peer1/peer
+/peer2/peer
+/peer3/peer

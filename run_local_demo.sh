@@ -1,89 +1,128 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Network and test parameters matching the Midterm Progress Report
-TRACKER_IP="127.0.0.1"
-TRACKER_PORT=9000
-PEER1_PORT=9101
-PEER2_PORT=9102
-PEER3_PORT=9103
-TEST_FILE="test_payload_31520.bin"
+# Run this on Linux or in Ubuntu/WSL. No changes to your actual peer configs.
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$ROOT"
+
+TRACKER_IP=127.0.0.1
+TRACKER_PORT="${TRACKER_PORT:-3490}"
+PEER1_PORT="${PEER1_PORT:-9101}"
+PEER2_PORT="${PEER2_PORT:-9102}"
+PEER3_PORT="${PEER3_PORT:-9103}"
+TEST_FILE=test_payload_31520.bin
 FILE_SIZE=31520
 
-# Ensure background tracker and peer processes are terminated when the script exits
+# Each demo has its own temporary tracker, peer folders, and configurations.
+WORK="$(mktemp -d)"
+LOGS="$ROOT/demo_logs"
+mkdir -p "$LOGS"
+TRACKER_PID=""
+PEER1_PID=""
+
 cleanup() {
-    echo "[CLEANUP] Stopping background tracker and peer processes..."
-    kill "${TRACKER_PID:-}" "${PEER1_PID:-}" 2>/dev/null || true
+    if [[ -n "$PEER1_PID" ]]; then kill "$PEER1_PID" 2>/dev/null || true; fi
+    if [[ -n "$TRACKER_PID" ]]; then kill "$TRACKER_PID" 2>/dev/null || true; fi
+    # Save the output, even if a test fails, for debugging and screenshots.
+    for name in tracker peer1 peer2 peer3; do
+        if [[ -f "$WORK/$name/run.log" ]]; then
+            cp "$WORK/$name/run.log" "$LOGS/$name.log" || true
+        fi
+    done
+    rm -rf "$WORK"
 }
 trap cleanup EXIT
 
-echo "============================================================"
-echo " RelayNet P2P File Sharing - Local Verification Suite"
-echo "============================================================"
-
-# Step 1: Compile the latest source files from engine/
-echo "[1/6] Building tracker and peer binaries..."
+printf '\n=== CS4390 P2P local demo ===\n'
+echo '[1/6] Compiling tracker and peer programs...'
 make all
 
-# Step 2: Generate a random 31,520-byte binary file in peer1's shared directory
-echo "[2/6] Generating ${FILE_SIZE}-byte test file in peer1/${TEST_FILE}..."
-dd if=/dev/urandom of="peer1/${TEST_FILE}" bs=1 count=${FILE_SIZE} status=none
+for name in tracker peer1 peer2 peer3; do
+    mkdir -p "$WORK/$name"
+done
+mkdir -p "$WORK/tracker/torrents"
+printf '%s torrents 900\n' "$TRACKER_PORT" > "$WORK/tracker/sconfig"
 
-# Compute original MD5 hash (supports both Linux md5sum and macOS md5 -q)
-ORIG_MD5=$(md5sum "peer1/${TEST_FILE}" 2>/dev/null | awk '{print $1}' || md5 -q "peer1/${TEST_FILE}")
-echo "      -> File Size    : ${FILE_SIZE} bytes"
-echo "      -> Original MD5 : ${ORIG_MD5}"
+for idx in 1 2 3; do
+    port_var="PEER${idx}_PORT"
+    peerport="${!port_var}"
+    mkdir -p "$WORK/peer$idx/shared"
+    printf '%s %s 60\n' "$TRACKER_PORT" "$TRACKER_IP" > "$WORK/peer$idx/clientThreadConfig.cfg"
+    printf '%s shared\n' "$peerport" > "$WORK/peer$idx/serverThreadConfig.cfg"
+done
 
-# Remove any leftover copies in peer2 and peer3 before testing
-rm -f "peer2/${TEST_FILE}" "peer3/${TEST_FILE}"
+echo "[2/6] Making $FILE_SIZE-byte sample file..."
+dd if=/dev/urandom of="$WORK/peer1/shared/$TEST_FILE" bs=1 count="$FILE_SIZE" status=none
+ORIGINAL_MD5="$(md5sum "$WORK/peer1/shared/$TEST_FILE" | cut -d ' ' -f 1)"
 
-# Step 3: Start the Tracker Server in the background
-echo "[3/6] Starting Tracker Server on ${TRACKER_IP}:${TRACKER_PORT}..."
-./tracker/tracker sconfig > tracker/tracker.log 2>&1 &
+echo "[3/6] Starting tracker at $TRACKER_IP:$TRACKER_PORT..."
+(cd "$WORK/tracker" && exec "$ROOT/tracker" > run.log 2>&1) &
 TRACKER_PID=$!
 sleep 1
-
-# Step 4: Start Peer 1 as a seeder and register the 31,520-byte file with the tracker
-echo "[4/6] Starting Peer 1 seeder (port ${PEER1_PORT}) and registering ${TEST_FILE}..."
-(cd peer1 && ./peer serve ../sconfig > peer1.log 2>&1) &
-PEER1_PID=$!
-sleep 1
-
-(cd peer1 && ./peer register "${TEST_FILE}" ../sconfig)
-
-# Step 5: Concurrently download the file on Peer 2 and Peer 3 using 4 worker threads
-echo "[5/6] Downloading ${TEST_FILE} concurrently on Peer 2 and Peer 3 (4 threads, max chunk 1024B)..."
-(cd peer2 && ./peer download "${TEST_FILE}" ../sconfig > download.log 2>&1) &
-P2_PID=$!
-
-(cd peer3 && ./peer download "${TEST_FILE}" ../sconfig > download.log 2>&1) &
-P3_PID=$!
-
-# Wait for both multithreaded downloads to complete
-wait "${P2_PID}" "${P3_PID}"
-
-# Compute MD5 hashes of the reconstructed files on Peer 2 and Peer 3
-P2_MD5=$(md5sum "peer2/${TEST_FILE}" 2>/dev/null | awk '{print $1}' || md5 -q "peer2/${TEST_FILE}")
-P3_MD5=$(md5sum "peer3/${TEST_FILE}" 2>/dev/null | awk '{print $1}' || md5 -q "peer3/${TEST_FILE}")
-
-echo "      -> Peer 1 (Original) MD5 : ${ORIG_MD5}"
-echo "      -> Peer 2 (Download) MD5 : ${P2_MD5}"
-echo "      -> Peer 3 (Download) MD5 : ${P3_MD5}"
-
-# Verify that all three MD5 digests are identical
-if [[ "${ORIG_MD5}" == "${P2_MD5}" && "${ORIG_MD5}" == "${P3_MD5}" ]]; then
-    echo "      [PASS] MD5 checksum verification matched across all peers!"
-else
-    echo "      [FAIL] MD5 checksum mismatch detected!"
+if ! kill -0 "$TRACKER_PID" 2>/dev/null; then
+    echo 'ERROR: Tracker did not start. Is port already being used?'
+    cat "$WORK/tracker/run.log"
     exit 1
 fi
 
-# Step 6: Negative test - send an oversized chunk request (> 1024 bytes) to Peer 1
-echo "[6/6] Testing protocol enforcement: requesting invalid 2048-byte chunk (> 1024B limit)..."
-INVALID_RESP=$(printf "GET_CHUNK %s 0 2048\n" "${TEST_FILE}" | nc -w 2 127.0.0.1 "${PEER1_PORT}" || true)
-echo "      -> Peer 1 response to 2048-byte chunk request: ${INVALID_RESP:-REJECTED (Connection Closed / Error)}"
-echo "      [PASS] Oversized chunk request (> 1024 bytes) was properly rejected."
+echo "[4/6] Starting peer 1 on port $PEER1_PORT and sharing file..."
+(cd "$WORK/peer1" && exec "$ROOT/peer1/peer" serve > run.log 2>&1) &
+PEER1_PID=$!
+sleep 1
+if ! kill -0 "$PEER1_PID" 2>/dev/null; then
+    echo 'ERROR: Peer 1 server did not start. Is its port in use?'
+    cat "$WORK/peer1/run.log"
+    exit 1
+fi
+(cd "$WORK/peer1" && "$ROOT/peer1/peer" share "$TEST_FILE")
 
-echo "============================================================"
-echo " ALL LOCAL TESTS PASSED SUCCESSFULLY"
-echo "============================================================"
+echo '[5/6] Downloading with four worker threads on both peers...'
+(cd "$WORK/peer2" && timeout 25 "$ROOT/peer2/peer" get "$TEST_FILE" > run.log 2>&1) &
+P2_PID=$!
+(cd "$WORK/peer3" && timeout 25 "$ROOT/peer3/peer" get "$TEST_FILE" > run.log 2>&1) &
+P3_PID=$!
+P2_STATUS=0
+P3_STATUS=0
+wait "$P2_PID" || P2_STATUS=$?
+wait "$P3_PID" || P3_STATUS=$?
+if (( P2_STATUS != 0 || P3_STATUS != 0 )); then
+    echo "ERROR: Peer downloads failed (peer2=$P2_STATUS, peer3=$P3_STATUS)"
+    cat "$WORK/peer2/run.log" "$WORK/peer3/run.log"
+    exit 1
+fi
+
+P2_MD5="$(md5sum "$WORK/peer2/shared/$TEST_FILE" | cut -d ' ' -f 1)"
+P3_MD5="$(md5sum "$WORK/peer3/shared/$TEST_FILE" | cut -d ' ' -f 1)"
+echo "Original MD5: $ORIGINAL_MD5"
+echo "Peer 2 MD5:  $P2_MD5"
+echo "Peer 3 MD5:  $P3_MD5"
+if [[ "$ORIGINAL_MD5" != "$P2_MD5" || "$ORIGINAL_MD5" != "$P3_MD5" ]]; then
+    echo '[FAIL] MD5 hashes do not match.'
+    exit 1
+fi
+echo '[PASS] Both peers got the same file.'
+grep 'worker .* finished' "$WORK/peer2/run.log" "$WORK/peer3/run.log" || true
+
+echo '[6/6] Asking for an invalid 2048-byte chunk (max is 1024)...'
+INVALID_RESP="$(python3 - "$PEER1_PORT" "$TEST_FILE" <<'PY'
+import socket
+import sys
+
+port = int(sys.argv[1])
+filename = sys.argv[2]
+with socket.create_connection(('127.0.0.1', port), timeout=4) as sock:
+    sock.settimeout(4)
+    sock.sendall(f'<GET {filename} 0 2048>\n'.encode())
+    print(sock.recv(256).decode().strip())
+PY
+)"
+echo "Peer 1 replied: $INVALID_RESP"
+if [[ "$INVALID_RESP" != '<GET invalid>' ]]; then
+    echo '[FAIL] Invalid chunk request was not rejected properly.'
+    exit 1
+fi
+
+echo '[PASS] Oversized request rejected correctly.'
+echo '=== ALL LOCAL DEMO CHECKS PASSED ==='
+echo "Log files are saved to: $LOGS"
+echo 'NOTE: This is one computer with 3 local peers, NOT a two-computer demonstration.'
